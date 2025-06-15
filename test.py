@@ -5,7 +5,6 @@ import math
 import time
 
 
-
 def flash_attention_v2_fp8_quant_per_head(q, k, v, causal=True, sm_scale=1):
     '''
     flash attention v2 fp8 quant per head
@@ -32,9 +31,9 @@ simple attention implement without multi head
 '''
 torch.manual_seed(180)
 def get_tensors(BS, HEAD, SEQLEN, DIM, dtype=torch.float16):
-    q = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=1).requires_grad_())
-    k = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=1).requires_grad_())
-    v = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=1).requires_grad_())
+    q = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
     return q, k, v
 
 def self_attention(q, k, v, causal=True, sm_scale=1):
@@ -88,7 +87,7 @@ def main(bs=1, head=32, seq_len=4096, head_dim=128):
     # print(f"difference:\n", (baseline - flash2_cutlass_ref.to(torch.float16)), flush=True)
     print(f"max diff: {torch.max(torch.abs(baseline - flash2_cutlass_ref.to(torch.float16)))}", flush=True)
 
-    assert torch.allclose(baseline, flash2_cutlass_ref.to(torch.float16), rtol=0, atol=1)
+    assert torch.allclose(baseline, flash2_cutlass_ref.to(torch.float16), rtol=0, atol=0.3)
     
     print(f"head:{head}, seq_len:{seq_len}, head_dim:{head_dim}, baseline: {base_time * 1000 / epoch}ms, flash2_cutlass_fp8: {flash2_time * 1000 / epoch}ms")
 
