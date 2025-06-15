@@ -5,6 +5,6 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("package_name", &function_name, "function_docstring"")
-    m.def("flash_attention_v2_cutlass", &flash_attention_v2_cutlass,
+    m.def("_flash_attention_v2_fp8", &flash_attention_v2_fp8,
           "Flash attention v2 implement in cutlass");
 }

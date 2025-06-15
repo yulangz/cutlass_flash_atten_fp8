@@ -53,7 +53,6 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
 
-    // TODO: review
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
@@ -62,15 +61,6 @@ struct Flash_fwd_kernel_traits : public Base {
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
         Tile<Int<16 * kNWarps>, _16, _32>>;
-        
-    // using TiledMma = TiledMMA< //(16*kNWarps, 16, 32)
-    //     typename Base::MMA_Atom_Arch,
-    //     Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
-    //     Tile<Int<16 * kNWarps>,
-    //         Layout<Shape <_2,_4,_2>, 
-    //                 Stride<_1,_4,_2>>, // Permutation on N, size 16                     
-    //         _32>>;
-
 
     using SmemLayoutAtom = decltype(
         composition(Swizzle<kSwizzle, 4, 3>{},

@@ -23,15 +23,12 @@ namespace flash {
 
 using namespace cute;
 
+// 计算thread的处理范围, mask掉超出范围的部分
 template <int kBlockM, int kBlockN, int kNWarps,typename Engine, typename Layout>
 inline __device__ void mask_within_nblock(Tensor<Engine, Layout> &tensor, const int m_block, const int nbi) {
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
-    // NOTE: 根据 mma_tile 的示意图来确定每个线程处理的是第几个 token
-
-    // NOTE:
-    // 计算thread的处理范围, mask掉超出范围的部分
-
+    
     const int lane_id = threadIdx.x % 32;
     const int col_idx_offset = kBlockN * nbi + (lane_id % 4) * 2; //根据 mma 指令集的特性，每行 8 个元素由 4 个线程处理
 
@@ -72,13 +69,35 @@ inline __device__ void mask_within_nblock(Tensor<Engine, Layout> &tensor, const 
     }
 }
 
-// NOTE: A矩阵已经在寄存器中的gemm封装
+template <typename FromType, typename ToType, typename Fragment>
+inline __device__ auto quant_to_fp8(Fragment const &acc_orig, float& scale) {
+  Tensor acc_fp8 = make_tensor<ToType>(shape(acc_orig));
+  {
+    float max_val = float(acc_orig(0));
+    for (int i = 1; i < size(acc_orig); ++i) {
+      max_val = max(max_val, float(acc_orig(i)));
+    }
+    // 相邻 4 个线程 reduce
+    max_val = max(max_val, __shfl_xor_sync(0xFFFFFFFF, max_val, 1));
+    max_val = max(max_val, __shfl_xor_sync(0xFFFFFFFF, max_val, 2));
+
+    scale = max_val / 448.0f; // e4m3 max
+
+    for (int i = 0; i < size(acc_orig); ++i) {
+      // 量化到 fp8
+      acc_fp8(i) = ToType(float(acc_orig(i)) / scale);
+    }
+  }
+  return acc_fp8;
+}
+
+// A矩阵已经在寄存器中的 gemm 封装
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
-inline __device__ void gemm_A_in_regs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
+inline __device__ void gemm_A_in_regs(Tensor0 &acc, float p_scale, float v_scale, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                       TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
                                       ThrCopy smem_thr_copy_B) {
-    // NOTE: 符合M N K描述: A[M, K] @ B[N, K] = C[M, N]
+    // 符合M N K描述: A[M, K] @ B[N, K] = C[M, N]
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
@@ -94,13 +113,19 @@ inline __device__ void gemm_A_in_regs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
+
+    // 反量化
+    for (int i = 0; i < size(acc); ++i) {
+        // p_scale, v_scale 是在kernel外部传入的
+        acc(i) = acc(i) * p_scale * v_scale;
+    }
 }
 
 template<typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
          typename ThrCopyA, typename ThrCopyB>
-inline __device__ void gemm_smem(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+inline __device__ void gemm_smem(Tensor0 &acc, float q_scale, float k_scale, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
                             Tensor4 const& tCsB, TiledMma tiled_mma,
                             TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
                             ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
@@ -112,7 +137,7 @@ inline __device__ void gemm_smem(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
 
-    // NOTE: s -> reg
+    // s -> reg
     cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{}));
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     #pragma unroll
@@ -122,6 +147,12 @@ inline __device__ void gemm_smem(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
             cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+
+    // 反量化
+    for (int i = 0; i < size(acc); ++i) {
+        // q_scale, k_scale 是在kernel外部传入的
+        acc(i) = acc(i) * q_scale * k_scale;
     }
 }
 
@@ -163,16 +194,25 @@ inline __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const
 
 
 template <typename ToType, typename Fragment>
-inline __device__ auto convert_float32_to_fp8(Fragment const &acc_fp32) {
-  Tensor acc_fp8 = make_tensor<ToType>(shape(acc_fp32));
+inline __device__ auto convert_float32_to_fp8(Fragment const &acc_fp32) { // (MMA, MMA_M, MMA_N) = ((_2,_2),_1,_8)
+  Tensor acc_fp8 = make_tensor<ToType>(shape(acc_fp32)); // ((_2,_2),_1,_8)
   using convert_type = std::conditional_t<
                             std::is_same_v<ToType, cutlass::float_e5m2_t>,
                             __nv_fp8x2_e5m2,
                             __nv_fp8x2_e4m3
                         >;
   {
-    Tensor acc_fp32x2 = recast< float2>(acc_fp32);
-    Tensor acc_fp8x2 = recast<convert_type>(acc_fp8);
+    Tensor acc_fp32x2 = recast< float2>(acc_fp32); // ((_1,_2),_1,_8)
+    Tensor acc_fp8x2 = recast<convert_type>(acc_fp8); // ((_1,_2),_1,_8)
+    #if (PRINT_DEBUG)
+    if (thread0()) {
+      print("acc_fp32: "); print(acc_fp32); print("\n");
+      print("acc_fp8: "); print(acc_fp8); print("\n");
+      print("acc_fp32x2: "); print(acc_fp32x2); print("\n");
+      print("acc_fp8x2: "); print(acc_fp8x2); print("\n");
+      print("size(acc_fp32x2): "); print(size(acc_fp32x2)); print("\n");
+    }
+    #endif
     for (int i = 0; i < size(acc_fp32x2); ++i) { 
       acc_fp8x2(i) = convert_type(acc_fp32x2(i)); 
     }
@@ -180,20 +220,6 @@ inline __device__ auto convert_float32_to_fp8(Fragment const &acc_fp32) {
   return acc_fp8;
 }
 
-
-// TODO:
-// https://github.com/NVIDIA/cutlass/issues/802
-// TODO: convert出来后数据是否在寄存器?
-// template <typename Fragment>
-// inline __device__ auto convert_type_f32_to_f16(Fragment const &acc_fp32) {
-//   Tensor acc_fp16 = make_tensor<cute::half_t>(shape(acc_fp32));
-//   {
-//     Tensor acc_fp32x2 = recast< float2>(acc_fp32);
-//     Tensor acc_fp16x2 = recast<__half2>(acc_fp16);
-//     for (int i = 0; i < size(acc_fp32x2); ++i) { acc_fp16x2(i) = __float22half2_rn(acc_fp32x2(i)); }
-//   }
-//   return acc_fp16;
-// }
 
 // Apply the exp to all the elements.
 template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
@@ -236,7 +262,7 @@ template<bool Is_first, typename Tensor0, typename Tensor1, typename Tensor2>
 inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
                                          Tensor2 &acc_o, float softmax_scale_log2) {
     if (Is_first) {
-        // NOTE: 第一次softmax不需要rescale, 只需要记录 Sij(kblockM, kblockN) 的 rowmax 和 rowsum
+        // 第一次softmax不需要rescale, 只需要记录 Sij(kblockM, kblockN) 的 rowmax 和 rowsum
         reduce_max</*zero_init=*/true>(scores, scores_max);
         flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
         reduce_sum(scores, scores_sum);
@@ -244,7 +270,7 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
         // 记录上一次的 rowmax
         Tensor scores_max_prev = make_fragment_like(scores_max); // 相当于公式中的 m_i^{j-1}
         cute::copy(scores_max, scores_max_prev);
-        // NOTE: 计算最新的 max 
+        // 计算最新的 max 
         // reduce_max包含步:
         //  1. 求当前thread内max: 遍历
         //  2. reduce thread间的max: 使用线程数洗牌指令做 all reduce，每个线程都获得了最大值
@@ -254,21 +280,21 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         #pragma unroll
         for (int mi = 0; mi < size(scores_max); ++mi) { // 遍历每一行
-            // NOTE: 辅助变量: 当前行max
+            // 辅助变量: 当前行max
             float scores_max_cur = scores_max(mi); // 当前行的最大值
-            // NOTE: 计算上一次 score_sum 的 rescale 值
+            // 计算上一次 score_sum 的 rescale 值
             float scores_scale = expf((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2); // 想当于公式中的 e^{m_i^{j-1} - m_i^{j}}.
             scores_sum(mi) *= scores_scale; // 想当于公式中的  e^{m_i^{j-1} - m_i^{j}}l_i^{j-1}
             #pragma unroll
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; } // 想当于公式中的 e^{m_i^{j-1} - m_i^{j}}O_i^{j-1}
         }
-        // NOTE: Apply the exp to all the elements with new max value， 这里相当于论文公式里的 P_i^_j
+        // Apply the exp to all the elements with new max value， 这里相当于论文公式里的 P_i^_j
         flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
 
         Tensor scores_sum_cur = make_fragment_like(scores_sum);  // l_i^{j} = e^{m_i^{j-1} - m_i^{j}}O_i^{j-1}
-        // NOTE: 累计求和
+        // 累计求和
         reduce_sum(scores, scores_sum_cur); // rowsum(P_i^_j)
-        // NOTE: 新分母累加到旧分母
+        // 新分母累加到旧分母
         #pragma unroll
         for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); } // l{ij} = e^{m_i^{j-1} - m_i^{j}}O_i^{j-1} + rowsum(P_i^_j)
     }
@@ -282,6 +308,9 @@ void set_params_fprop(Flash_fwd_params &params,
                       const torch::Tensor q,
                       const torch::Tensor k,
                       const torch::Tensor v,
+                      const torch::Tensor q_scale_per_head,
+                      const torch::Tensor k_scale_per_head,
+                      const torch::Tensor v_scale_per_head,
                       torch::Tensor out,
 
                       void *softmax_lse_d,
@@ -317,6 +346,10 @@ void set_params_fprop(Flash_fwd_params &params,
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.out_ptr = out.data_ptr();
+
+  params.q_scale_per_head_ptr = q_scale_per_head.data_ptr();
+  params.k_scale_per_head_ptr = k_scale_per_head.data_ptr();
+  params.v_scale_per_head_ptr = v_scale_per_head.data_ptr();
 }
 
 
@@ -342,8 +375,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // The thread index.
   const int tidx = threadIdx.x;
 
-  // TODO: 传入泛型
-  // NOTE: 小技巧
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
   using TiledMMA = typename Kernel_traits::TiledMma;
@@ -364,9 +395,12 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   SharedStorage &shared_storage = *reinterpret_cast<SharedStorage *>(smem_);
 
   const int bs_head_offset = base_id * params.head_stride;
+  const float q_scale = reinterpret_cast<float *>(params.q_scale_per_head_ptr)[base_id];
+  const float k_scale = reinterpret_cast<float *>(params.k_scale_per_head_ptr)[base_id];
+  const float v_scale = reinterpret_cast<float *>(params.v_scale_per_head_ptr)[base_id];
 
   // TODO: base offset for MHA
-  // NOTE: convert C pointer to Tensor for convenience
+  // convert C pointer to Tensor for convenience
   Tensor Q = make_tensor(
       make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + bs_head_offset),
       make_shape(params.q_seqlen, Int<kHeadDim>{}),
@@ -386,20 +420,29 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   
   // 加载Q, K, V分块
-  // (kBlockM, kHeadDim, num_tile_k)
+  // (kBlockM, kHeadDim, num_tile_k=1)
   Tensor gQ = local_tile(Q, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(m_block, _));
-  // NOTE: loading流水线, 初次加载所需K, V
-  Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _)); // (kBlockN, kHeadDim, num_tile_k)
-  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0)); // 这里注意 V，因为已经转置了，(kHeadDim, kBlockN, num_tile_k)
+  // loading流水线, 初次加载所需K, V
+  Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _)); // (kBlockN, kHeadDim, num_tile_k=1)
+  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0)); // V 已经转置了 (kHeadDim, kBlockN, num_tile_k=1)
 
   // 获取MMA抽象
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(tidx);
 
 #if (PRINT_DEBUG)
-  if (cute::thread0()) {
-    cute::print(tiled_mma);
-    cute::print_latex(tiled_mma);
+  if (thread0()) {
+    print("TiledMMA: "); print_latex(tiled_mma); print(tiled_mma); print("\n");
+    
+    print("thr_mma: "); print(thr_mma); print("\n");
+
+    print("Q: "); print(Q); print("\n");
+    print("K: "); print(K); print("\n");
+    print("V: "); print(V); print("\n");
+
+    print("gQ: "); print(gQ); print("\n");
+    print("gK: "); print(gK); print("\n");
+    print("gV: "); print(gV); print("\n");
   }
 #endif
 
@@ -408,12 +451,12 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{}); //(kBlockN, kHeadDim)
   Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{}); //(kHeadDim, kBlockN)
 
-  // NOTE: copy抽象
-  // NOTE: QKV gmem -> smem拷贝的抽象
+  // copy抽象
+  // QKV gmem -> smem拷贝的抽象
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
   auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
-  // NOTE: 定义gmem -> smem拷贝的src, dst
+  // 定义gmem -> smem拷贝的src, dst
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ(_, _, 0));
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
   Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
@@ -421,14 +464,34 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
   Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
+#if (PRINT_DEBUG)
+  if (thread0()) {
+    print("gmem_tiled_copy_QKV: "); print(gmem_tiled_copy_QKV); print("\n");
+    print("gmem_thr_copy_QKV: "); print(gmem_thr_copy_QKV); print("\n");
 
-  // NOTE: 定义smem -> reg拷贝的dst
-  // partition_fragment与partition类似, 只是返回的是寄存器表示
-  Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K) =  ((4, 2, 2), MMA_M, MMA_N)
-  Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K) =  ((4, 2), MMA_N, MMA_K)
-  Tensor tOrV  = thr_mma.partition_fragment_B(sV);                           // (MMA,MMA_K,MMA_N) =  ((2, 2), MMA_M, MMA_N)
+    print("tQgQ: "); print(tQgQ); print("\n");
+    print("tQsQ: "); print(tQsQ); print("\n");
+    print("tKgK: "); print(tKgK); print("\n");
+    print("tKsK: "); print(tKsK); print("\n");
+    print("tVgV: "); print(tVgV); print("\n");
+    print("tVsV: "); print(tVsV); print("\n");
+  }
+#endif
+
+  // Q、K、V reg Tensor
+  Tensor tCrQ  = thr_mma.partition_fragment_A(sQ);     // ((_4,_2,_2),_1,(_2,_2))
+  Tensor tCrK  = thr_mma.partition_fragment_B(sK);     // ((_4,_2),(_2,_4),(_2,_2))
+  Tensor tCrV  = thr_mma.partition_fragment_B(sV);     // ((_4,_2),(_2,_8),_2)
+
+#if (PRINT_DEBUG)
+  if (thread0()) {
+    print("tCrQ: "); print(tCrQ); print("\n");
+    print("tCrK: "); print(tCrK); print("\n");
+    print("tCrV: "); print(tCrV); print("\n");
+  }
+#endif
  
-  // NOTE: 准备拷贝Q, K, V到 reg 的copy对象 (smem --> reg)
+  // 准备拷贝Q, K, V到 reg 的copy对象 (smem --> reg)
   auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ); // tSsQ --> tSrQ
@@ -436,14 +499,12 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
   Tensor tSsK = smem_thr_copy_K.partition_S(sK); // tSrK --> tSsK
-  
 
-  // TODO: 拷贝时转置
-  // NOTE: smem->reg拷贝Vt
+  // smem->reg拷贝V
   auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
   Tensor tOsV = smem_thr_copy_V.partition_S(sV);
-  // NOTE: 命名规则, t表示to, s/g表示位置(smem, gmem)
+  // 命名规则, t表示to, s/g表示位置(smem, gmem)
   // 从smem加载时做retiling
   // tKgK表示gmem中的K, 用作gmem->smem的src
   // tKsK表示smem中的K, 用作gmem->smem的dst
@@ -457,26 +518,39 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // 开始执行异步拷贝
   cute::cp_async_fence();
 
-  Tensor rAccOut = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{}); // （MMA, MMA_M, MMA_K)
+  Tensor rAccOut = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{}); // ((_2,_2),_1,_16)
 
-  // NOTE: K, V分块的数量: 处理的区间
+  // K, V分块的数量: 处理的区间
   const int n_block_min = 0;
-  // NOTE: 1. mask between N BLOCKs if is causal mode
+  // 1. mask between N BLOCKs if is causal mode
   int seqlen_start = m_block * kBlockM;
   int seqlen_end = (m_block + 1) * kBlockM;
   int n_block_max = Is_causal ? cute::ceil_div(seqlen_end, kBlockN) : cute::ceil_div(params.k_seqlen, kBlockN); 
 
-  // NOTE: row_max 和 row_sum 
-  Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{}); // （2 * MMA_M）
+  // row_max
+  Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{}); // (_2)
 
-  // NOTE: 需要记录的 softmax 分母
-  Tensor scores_sum = make_fragment_like(scores_max); // （2 * MMA_M）
+  // row_sum, softmax 的分母
+  Tensor scores_sum = make_fragment_like(scores_max); // (_2)
 
   clear(rAccOut); // （MMA=(2,2), MMA_M, MMA_K), 初始化为 0 
 
+#if (PRINT_DEBUG)
+  if (thread0()) {
+    print("rAccOut: "); print(rAccOut); print("\n");
+    print("scores_max: "); print(scores_max); print("\n");
+    print("scores_sum: "); print(scores_sum); print("\n");
+  }
+#endif
+
   for (int nbi = n_block_min; nbi < n_block_max; nbi++) {
-    auto rAccScore = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}); //(MMA=(2,2), MMA_M, MMA_N)
+    auto rAccScore = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}); //(MMA=(2,2), MMA_M, MMA_N) = ((_2,_2),_1,_8)
     clear(rAccScore); // 初始化为 0
+    # if (PRINT_DEBUG)
+    if (thread0() && nbi == n_block_min) {
+      print("rAccScore: "); print(rAccScore); print("\n");
+    }
+    # endif
 
     // 等待Q, K的gmem -> smem拷贝完成, 即Q, K就绪
     // wait<0>表示等待还剩0个未完成
@@ -492,20 +566,26 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     cute::cp_async_fence();
 
     // O = Q@K.T
-    // NOTE: 加载smem中的数据到reg再做gemm, **加载期间执行retile**
-    flash::gemm_smem(rAccScore, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+    // 加载smem中的数据到reg再做gemm, **加载期间执行retile**
+    flash::gemm_smem(rAccScore, q_scale, k_scale, tCrQ, tCrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
         smem_thr_copy_Q, smem_thr_copy_K
     );
 
-    // NOTE: Convert from layout C to layout A;  (MMA=(2, 2),(MMA_M, MMA_N)) --> ((2, MMA_M),(2, MMA_N))
+    // Convert from layout C to layout A;  (MMA=(2, 2),(MMA_M, MMA_N)) --> ((2, MMA_M),(2, MMA_N)) = ((_2,_1),(_2,_8))
     Tensor scores = make_tensor(rAccScore.data(), flash::convert_layout_acc_rowcol(rAccScore.layout()));
 
-    // NOTE: 2. mask within N BLOCKs
+    #if (PRINT_DEBUG)
+    if (thread0() && nbi == n_block_min) {
+      print("scores: "); print(scores); print("\n");
+    }
+    #endif
+
+    // 2. mask within N BLOCKs
     if (Is_causal ==  true && nbi * kBlockN >= seqlen_start) {
       flash::mask_within_nblock<kBlockM, kBlockN, kNWarps>(scores, m_block, nbi);
     }
   
-    // NOTE: 等待V加载完成, 为下个K加载准备初始状态
+    // 等待V加载完成, 为下个K加载准备初始状态
     flash::cp_async_wait<0>();
     __syncthreads();
     
@@ -529,23 +609,31 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     // 计算完成后， scores 相当于公式中的 P_i^j
     // 实际执行 P_i^j @ V
     // (score AKA rAccScore): exp(QK[M, N] - m_i^j) @ V[N, dim]
-    // NOTE: DABC: F32F8F8F32, convert D type(F32) to A type(F8)
-    Tensor rP = flash::convert_float32_to_fp8<Element>(rAccScore);
+    float p_scale;
+    auto rP = flash::quant_to_fp8<float, Element>(rAccScore, p_scale); 
+    #if (PRINT_DEBUG)
+    if (thread0() && nbi == n_block_min) {
+      print("before reg2reg rP: "); print(rP); print("\n"); // ((_2,_2),_1,_8)
+    }
+    #endif
     auto reg2reg = ReorgCFp8toAFp8();
     reg2reg(rP);
-    // NOTE: Convert from layout C to layout A;  (MMA=(2, 2), MMA_M, MMA_N)) --> (MMA=(4, 2, 2), MMA_M, MMA_N))
-    // 这里由于写死了 kBlockM, KBlockN 都为64，所以第一个 gemm 的输出总是为(64，64), 因此根据 MMA 指令集的特性，可以容易算出 MMA_M = 1, MMA_N = 2
-    //（我暂时不知道怎么写 layout 除法（针对静态shape），所以目前固定写为下面这种形式）
+    #if (PRINT_DEBUG)
+    if (thread0() && nbi == n_block_min) {
+      print("after reg2reg rP: "); print(rP); print("\n"); // ((_2,_2),_1,_8)
+    }
+    #endif
+    // Convert from layout C to layout A;  (MMA=(2, 2), MMA_M, MMA_N)) --> (MMA=(4, 2, 2), MMA_M, MMA_N))
+    // rP:((2, 2), (1, 8)) --> ((4, 2, 2), 1, 2)
     auto tOrPLayout = Layout<Shape<Shape<_4, _2, _2>, _1, _2>>{};
-    Tensor tOrP = make_tensor(rP.data(), tOrPLayout);
-    // rAccOut:((2, 2),(MMA_M, MMA_N))
-    flash::gemm_A_in_regs(rAccOut, tOrP, tOrV, tOsV, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-  } 
-  
-  
+    Tensor tOrP = make_tensor(rP.data(), tOrPLayout); // ((_4,_2,_2),_1,_2)
+    // rAccOut:((2, 2),(MMA_M, MMA_N)) = ((_2,_2),_1,_16)
+    flash::gemm_A_in_regs(rAccOut, p_scale, v_scale, tOrP, tCrV, tOsV, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+  }
+
   // Epilogue
 
-  // NOTE: 最后统一除上分母部分
+  // 最后统一除上分母部分
   // Reshape acc_o from ((2,2), 1, 8) to (nrow=(2, 1), ncol=(2, 8))
   // AKA reshape to (nrow, ncol) but with specific MMA layout
   Tensor acc_o_rowcol = make_tensor(rAccOut.data(), flash::convert_layout_acc_rowcol(rAccOut.layout()));
@@ -574,7 +662,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
   Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
-  // NOTE: 先拷贝到smem
+  // 先拷贝到smem
   cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
   Tensor gO = local_tile(O, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(m_block, _));
@@ -609,7 +697,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
   int smem_size = int(sizeof(SharedStorage<Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>));
 
   auto kernel = &flash_attention_v2_cutlass_kernel<Kernel_traits, Is_causal, Flash_fwd_params>;
-  // NOTE: smem过大时需要设置
+  // smem过大时需要设置
   if (smem_size >= 48 * 1024) {
       CUDA_ERROR_CHECK(cudaFuncSetAttribute(
           kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -645,8 +733,10 @@ void run_flash_attn_cutlass(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-std::vector<torch::Tensor> flash_attention_v2_cutlass(torch::Tensor q, torch::Tensor k,
-                                      torch::Tensor v, bool is_causal = false, float softmax_scale=1) {
+std::vector<torch::Tensor> flash_attention_v2_fp8(torch::Tensor q, torch::Tensor k,
+                            torch::Tensor v, torch::Tensor q_scale_per_head,
+                            torch::Tensor k_scale_per_head, torch::Tensor v_scale_per_head,
+                            bool is_causal = false, float softmax_scale=1) {
 
   CHECK_INPUT(q);
   CHECK_INPUT(k);
@@ -664,8 +754,8 @@ std::vector<torch::Tensor> flash_attention_v2_cutlass(torch::Tensor q, torch::Te
   // auto out = torch::empty_like(q, opts.dtype(torch::kFloat16));
   auto out = torch::empty_like(q);
   Flash_fwd_params params;
-  set_params_fprop(params, q, k, v, out,
-      nullptr, softmax_scale, is_causal);
+  set_params_fprop(params, q, k, v, q_scale_per_head, k_scale_per_head, v_scale_per_head,
+    out, nullptr, softmax_scale, is_causal);
 
   run_flash_attn_cutlass(params, 0);
 
