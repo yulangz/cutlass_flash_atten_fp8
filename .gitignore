@@ -2,4 +2,3 @@ build/
 .cache/
 dist/
 tiny_attention_cutlass_fp8.egg-info
-deps/
