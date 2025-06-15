@@ -96,7 +96,6 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemKVCount = size(SmemLayoutK{}) + size(SmemLayoutV{});
     static constexpr int kSmemQSize = kSmemQCount * sizeof(Element);
     static constexpr int kSmemKVSize = kSmemKVCount * sizeof(Element);
-    // TODO:
     static constexpr int kSmemSize = kSmemQSize + kSmemKVSize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -108,8 +107,6 @@ struct Flash_fwd_kernel_traits : public Base {
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
 
-    // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
-    // from the same address by the same threadblock. This is slightly faster.
     using Gmem_copy_struct = std::conditional_t<
         Has_cp_async,
         SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
