@@ -67,7 +67,7 @@ __device__ inline void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Eng
     for (int i = 0; i < size(dst); i++){
         // NOTE: 4表示4个线程, 因为在SM80_16x8x16_F32F16F16F32_TN中,
         // 每组每行就是4个线程处理8个value的, 每个线程处理2个value
-        dst(i) = Allreduce<4>::run(src(i), op); // SM89_16x8x32_F32F8F8F32_E4M3_TN 同
+        dst(i) = Allreduce<4>::run(src(i), op); // SM89_16x8x32_F32E4M3E4M3F32_TN 同
     }
 }
 

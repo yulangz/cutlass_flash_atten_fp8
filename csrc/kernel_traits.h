@@ -1,13 +1,19 @@
 #pragma once
 
-#include "cute/algorithm/copy.hpp"
+// #include "cute/algorithm/copy.hpp"
 
-#include "cutlass/cutlass.h"
-#include "cutlass/layout/layout.h"
-#include <cutlass/numeric_types.h>
+// #include "cutlass/cutlass.h"
+// #include "cutlass/layout/layout.h"
+// #include <cutlass/numeric_types.h>
 
-#include "mma_sm89.hpp"
-#include "mma_traits_sm89.hpp"
+#include "cute/int_tuple.hpp"
+#include "cute/numeric/numeric_types.hpp"
+#include "cute/util/print.hpp"
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cute/tensor.hpp>
+#include <cute/util/debug.hpp>
+
 using namespace cute;
 
 
@@ -22,8 +28,8 @@ struct Flash_kernel_traits {
 
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::float_e5m2_t>,
-        MMA_Atom<SM89_16x8x32_F32F8F8F32_E5M2_TN>,
-        MMA_Atom<SM89_16x8x32_F32F8F8F32_E4M3_TN>
+        MMA_Atom<SM89_16x8x32_F32E5M2E5M2F32_TN>,
+        MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>
     >;
 
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;

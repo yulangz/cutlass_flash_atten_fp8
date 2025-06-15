@@ -17,6 +17,8 @@
 #include "utils.h"
 #include "reg2reg.h"
 
+#define PRINT_DEBUG 0
+
 namespace flash {
 
 using namespace cute;
@@ -384,15 +386,22 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   
   // 加载Q, K, V分块
-  // (kBlockM, kHeadDim, num_tile_n)
+  // (kBlockM, kHeadDim, num_tile_k)
   Tensor gQ = local_tile(Q, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(m_block, _));
   // NOTE: loading流水线, 初次加载所需K, V
-  Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
-  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0)); // 这里注意 V，因为已经转置了
+  Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _)); // (kBlockN, kHeadDim, num_tile_k)
+  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0)); // 这里注意 V，因为已经转置了，(kHeadDim, kBlockN, num_tile_k)
 
   // 获取MMA抽象
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(tidx);
+
+#if (PRINT_DEBUG)
+  if (cute::thread0()) {
+    cute::print(tiled_mma);
+    cute::print_latex(tiled_mma);
+  }
+#endif
 
   // Construct SMEM tensors.
   Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{}); //(kBlockM, kHeadDim)
@@ -457,7 +466,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   int seqlen_end = (m_block + 1) * kBlockM;
   int n_block_max = Is_causal ? cute::ceil_div(seqlen_end, kBlockN) : cute::ceil_div(params.k_seqlen, kBlockN); 
 
-  // NOTE: 需要记录的max
+  // NOTE: row_max 和 row_sum 
   Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{}); // （2 * MMA_M）
 
   // NOTE: 需要记录的 softmax 分母
@@ -475,7 +484,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     __syncthreads();
 
     // gemm的同时异步加载V
-    gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_,  nbi));
+    gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_,  nbi)); // (kHeadDim, kBlockN, num_tile_k=1)，V 是 [dim, n]，dim 维度不切分，n 维度按照 kBlockN 大小切分，取第 nbi 个
     tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
     // 异步加载V到smem
     flash::copy(gmem_tiled_copy_QKV, tVgV, tVsV);
@@ -666,6 +675,3 @@ std::vector<torch::Tensor> flash_attention_v2_cutlass(torch::Tensor q, torch::Te
 
   return {out};
 }
-
-
-
